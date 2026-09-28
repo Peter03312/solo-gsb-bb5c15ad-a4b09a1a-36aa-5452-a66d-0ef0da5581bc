@@ -7,9 +7,12 @@
 - ``{name, select, ...}``             → string，并记录允许的分支键
 - 同一变量被 number 与 string 两类用法同时约束时，标记模板内类型冲突
 
-必需性：
-- 任一用法不处于任何分支节点守卫之下 → 必需（required）
-- 全部用法都在分支内 → 条件必需（conditional），记录守卫的语义路径
+必需性（按 AST 的路径组合语义推导）：
+- 顺序组合：各片段的“必然使用变量集”取并集；
+- 分支组合（plural / selectordinal / select）：各分支的集合取交集——
+  变量在**每条完整分支路径**上都会被使用即为必需（required），
+  即使它的每一处用法都写在分支内；
+- 仅在部分路径上使用的变量为条件必需（conditional），记录守卫的语义路径。
 
 场景校验批量产出三类问题（并记录其在模板与场景中的首次出现位置）：
 - missing_required / missing_conditional 缺失变量
@@ -115,7 +118,7 @@ class Usage:
 class Contract:
     name: str
     usages: list[Usage] = field(default_factory=list)
-    unconditional: bool = False
+    unconditional: bool = False  # 在每条完整分支路径上都会被使用
     guards: list[str] = field(default_factory=list)  # 去重后的守卫语义路径
 
     @property
@@ -155,8 +158,43 @@ def _node_kind(node) -> str:
     return node.kind if isinstance(node, Plural) else "select"
 
 
+def _guaranteed_vars(frag: list, plural_stack: list) -> set[str]:
+    """返回在片段的每条完整分支路径上都必然被使用的变量名集合。
+
+    顺序组合（同一消息片段中的节点序列）取并集；分支组合
+    （Plural / Select 的各分支）取交集。分支节点本身的选择变量、
+    plural 内 ``#`` 的属主变量同样计入。
+    """
+    guaranteed: set[str] = set()
+    for node in frag:
+        if isinstance(node, (Arg, FmtArg)):
+            if node.name and node.name != "?":
+                guaranteed.add(node.name)
+        elif isinstance(node, Hash):
+            if plural_stack:
+                guaranteed.add(plural_stack[-1].name)
+        elif isinstance(node, (Plural, Select)):
+            # 分支节点的选择变量在所有路径上都会先被求值
+            if node.name and node.name != "?":
+                guaranteed.add(node.name)
+            if node.branches:
+                inner: set[str] | None = None
+                for b in node.branches:
+                    bset = _guaranteed_vars(b.message, plural_stack + [node])
+                    inner = bset if inner is None else inner & bset
+                if inner:
+                    guaranteed |= inner
+            # 无分支（错误恢复 AST）时不引入额外必然变量
+    return guaranteed
+
+
 def derive_contracts(template: str, parts: list) -> dict[str, Contract]:
-    """遍历 AST，按变量收集用法、约束与分支守卫信息。"""
+    """遍历 AST，按变量收集用法、约束与分支守卫信息。
+
+    必需性不由“是否写在分支内”决定，而按 AST 的顺序组合（并集）与
+    分支交集判断：变量在每条完整分支路径上都被使用即为必需
+    （见 ``_guaranteed_vars``）；仅在部分路径上使用时为条件必需。
+    """
     contracts: dict[str, Contract] = {}
 
     def get(name: str) -> Contract:
@@ -172,9 +210,7 @@ def derive_contracts(template: str, parts: list) -> dict[str, Contract]:
             return
         c = get(name)
         c.usages.append(Usage(kind, pos, constraint, select))
-        if not guard_chain:
-            c.unconditional = True
-        else:
+        if guard_chain:
             guard = "/".join(guard_chain)
             if guard not in c.guards:
                 c.guards.append(guard)
@@ -211,6 +247,8 @@ def derive_contracts(template: str, parts: list) -> dict[str, Contract]:
                          plural_stack)
 
     walk(parts, (), [])
+    for name in _guaranteed_vars(parts, []):
+        contracts[name].unconditional = True
     return contracts
 
 
@@ -389,7 +427,7 @@ def evaluate_scenario(sc: dict, index: int, template: str,
             if c.unconditional:
                 issues.append(_issue(
                     "missing_required", SEVERITY_ERROR,
-                    f"必需变量 '{var_name}' 缺失（在模板顶层使用）",
+                    f"必需变量 '{var_name}' 缺失（模板的每条分支路径都会使用它）",
                     var_name, sc, index, template, pos))
             else:
                 guard = c.guards[0] if c.guards else "某分支"

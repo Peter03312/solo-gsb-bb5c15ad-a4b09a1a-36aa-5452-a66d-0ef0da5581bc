@@ -31,8 +31,11 @@
   单侧解析或运行失败只保留该侧错误，不阻断其余场景。
 - **变量管理**：从模板一键提取变量；数值 / 布尔自动识别。
 - **变量契约审计**：从模板 AST 推导每个变量在简单占位、`number`、`plural`、
-  `select`、`selectordinal`（含 plural 内的 `#`）中的**允许类型与必需性**
-  （顶层使用为必需，仅在分支内使用为条件必需并记录守卫路径）；同一变量被
+  `select`、`selectordinal`（含 plural 内的 `#`）中的**允许类型与必需性**。
+  必需性按 AST 的路径组合判断：顺序片段取并集、分支节点各分支取交集——变量
+  **在每条完整分支路径上都会被使用**即为必需（即使每处用法都写在分支内，
+  包括同一变量分散在不同分支节点、嵌套 `select` / `plural` / `selectordinal`
+  的情况）；仅在部分路径上使用的才是条件必需，并记录守卫路径。同一变量被
   数字用法与字符串用法同时约束时报告模板内类型冲突。支持**导入多组场景样例**
   （场景集导出文件、场景数组或 `{"scenarios": [...]}`），批量报告缺失变量、
   类型冲突、无效复数值、无匹配的 select 键（含非法场景），并给出每个问题在
@@ -46,9 +49,19 @@
 
 ### 方式一：Docker Compose（推荐）
 
+一条命令构建镜像并启动服务（需要本机可用的 Docker / Docker Compose）：
+
 ```bash
 docker compose up --build
 ```
+
+启动后保持终端运行（后台运行可加 `-d`）。必要配置（`docker-compose.yml`）：
+
+- `ports: "5000:5000"`：把容器内服务映射到宿主机 5000 端口；
+- `environment.PORT=5000`：Flask / gunicorn 监听端口，修改端口时
+  端口映射需同步调整。
+
+无需数据库或额外密钥，开箱即用。
 
 ### 方式二：Docker
 
@@ -147,8 +160,13 @@ python app.py            # 或：gunicorn --bind 0.0.0.0:5000 app:app
    - **允许类型**：简单占位 → 任意标量（字符串 / 数字 / 布尔）；`number`、
      `plural`、`selectordinal`（及 plural 内的 `#`）→ 数字；`select` → 字符串；
      `date` / `time` / `spellout` / `ordinal` / `duration` → 任意标量；
-   - **必需性**：不处于任何分支守卫下的变量为**必需**；仅出现在分支内的为
-     **条件必需**，并记录守卫的语义路径（如 `gender:select@male/count:plural@one`）；
+   - **必需性**：按 AST 的路径组合推导——顺序片段的必然使用变量取并集、
+     `plural` / `selectordinal` / `select` 各分支取交集。变量在**每条完整
+     分支路径**上都会使用时为**必需**（即使它只写在分支内；如
+     `{g, select, a{Hi {name}} other{Hey {name}}}` 中的 `name`，或同一变量
+     分散在不同分支节点、嵌套分支中共同覆盖全部路径）；仅在部分路径上出现
+     的为**条件必需**，并记录守卫的语义路径（如
+     `gender:select@male/count:plural@one`）；
    - **select 分支键**：收集允许的键，并标注是否缺少 `other` 兜底；
    - **模板内类型冲突**：同一变量同时被要求为数字（number/plural）与字符串
      （select）时直接标红。
@@ -248,7 +266,9 @@ python app.py            # 或：gunicorn --bind 0.0.0.0:5000 app:app
   - `template_ok` / `errors`：模板是否可解析及带行列号的语法错误（有错误时
     契约仍基于可恢复 AST 推导）；
   - `contracts`：按首次出现顺序排列的变量契约，每项含 `name`、`required` /
-    `required_kind`（`required` / `conditional`）、`guards`（守卫语义路径）、
+    `required_kind`（`required` = 在每条完整分支路径上都会使用，含写在分支内
+    但由分支交集推导出的必需；`conditional` = 仅部分路径使用）、
+    `guards`（守卫语义路径）、
     `resolved_type`（`number` / `string` / `any` / `conflict`）、
     `allowed_types`、`type_conflict`、`usage_kinds` / `usage_labels`、
     `select.selectors` / `select.has_other`、首次出现位置
